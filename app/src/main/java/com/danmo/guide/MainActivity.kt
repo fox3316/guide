@@ -57,7 +57,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     private fun initializeDetector() {
         try {
-            val modelFile = "ssd_mobilenet_v1.tflite"
+            val modelFile = "efficientdet_lite0.tflite"
             val inputStream = assets.open(modelFile)
             val modelBuffer = inputStream.readBytes()
             val byteBuffer = ByteBuffer.allocateDirect(modelBuffer.size).apply {
