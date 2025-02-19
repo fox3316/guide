@@ -1,8 +1,12 @@
 package com.danmo.guide
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.widget.Toast
@@ -29,7 +33,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private lateinit var cameraExecutor: ExecutorService
     private var objectDetector: ObjectDetector? = null
     private lateinit var tts: TextToSpeech
-
+    private var vibrator: Vibrator? = null
     private var lastSpeakTime = 0L
     private val speakCooldown = 3000L // 3 seconds cooldown
     private var isTtsReady = false
@@ -47,7 +51,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
+        vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         cameraExecutor = Executors.newSingleThreadExecutor()
 
         initializeDetector()
@@ -152,7 +156,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         val results = objectDetector?.detect(processedImage) ?: emptyList()
 
         handleDetectionResults(results)
-        updateStatusUI(results)
+        updateStatusUI(results)  // 确保调用此方法更新 UI
 
         imageProxy.close()
     }
@@ -165,10 +169,35 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
         results.maxByOrNull { it.categories[0].score }?.let { topResult ->
             when {
-                isDangerousDistance(topResult) -> speakSafetyWarning(topResult)
-                else -> speakObjectName(topResult)
+                isDangerousDistance(topResult) -> {
+                    speakSafetyWarning(topResult)
+                    vibrate(500)  // 危险情况长震动
+                }
+                else -> {
+                    speakObjectName(topResult)
+                    vibrate(200)  // 普通情况短震动
+                }
             }
             lastSpeakTime = currentTime
+        }
+    }
+    private fun vibrate(durationMs: Long) {
+        if (vibrator?.hasVibrator() != true) return
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(
+                    VibrationEffect.createOneShot(
+                        durationMs,
+                        VibrationEffect.DEFAULT_AMPLITUDE
+                    )
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(durationMs)
+            }
+        } catch (e: Exception) {
+            Log.e("Vibration", "震动失败", e)
         }
     }
 
