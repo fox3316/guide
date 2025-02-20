@@ -3,6 +3,7 @@ package com.danmo.guide
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.RectF
 import android.os.Build
 import android.os.Bundle
 import android.os.VibrationEffect
@@ -30,6 +31,7 @@ import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private lateinit var binding: ActivityMainBinding
+    private lateinit var overlayView: OverlayView  // 添加OverlayView引用
     private lateinit var cameraExecutor: ExecutorService
     private var objectDetector: ObjectDetector? = null
     private lateinit var tts: TextToSpeech
@@ -38,11 +40,12 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private val speakCooldown = 3000L // 3 seconds cooldown
     private var isTtsReady = false
 
+    // 修改权限提示的Toast
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) startCamera()
-        else showToast("需要相机权限才能使用导盲功能")
+        else showToast("Camera permission required for guide feature")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -53,6 +56,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         setContentView(binding.root)
         vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         cameraExecutor = Executors.newSingleThreadExecutor()
+        overlayView = binding.overlayView  // 初始化OverlayView
 
         initializeDetector()
         initializeTts()
@@ -87,7 +91,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             }
         } catch (e: Exception) {
             Log.e("ObjectDetector", "初始化失败: ${e.stackTraceToString()}")
-            showToast("物体检测模块初始化失败")
+            showToast("Object detection module initialization failed")
             finish()
         }
     }
@@ -156,9 +160,18 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         val results = objectDetector?.detect(processedImage) ?: emptyList()
 
         handleDetectionResults(results)
-        updateStatusUI(results)  // 确保调用此方法更新 UI
+        updateStatusUI(results)
+
+        // 更新OverlayView的绘制内容
+        updateOverlayView(results, imageProxy.imageInfo.rotationDegrees)
 
         imageProxy.close()
+    }
+
+    private fun updateOverlayView(results: List<Detection>, rotationDegrees: Int) {
+        runOnUiThread {
+            overlayView.updateDetections(results, rotationDegrees)  // 调用OverlayView的更新方法
+        }
     }
 
     private fun handleDetectionResults(results: List<Detection>) {
@@ -174,13 +187,14 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     vibrate(500)  // 危险情况长震动
                 }
                 else -> {
-                    speakObjectName(topResult)
+                    speakObjectNameWithDirection(topResult)
                     vibrate(200)  // 普通情况短震动
                 }
             }
             lastSpeakTime = currentTime
         }
     }
+
     private fun vibrate(durationMs: Long) {
         if (vibrator?.hasVibrator() != true) return
 
@@ -197,7 +211,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 vibrator?.vibrate(durationMs)
             }
         } catch (e: Exception) {
-            Log.e("Vibration", "震动失败", e)
+            Log.e("Vibration", "Vibration failed", e)
         }
     }
 
@@ -210,22 +224,47 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private fun speakSafetyWarning(result: Detection) {
         val label = result.categories[0].label
         val warning = when {
-            label.contains("car", true) -> "危险！前方有车辆靠近"
-            label.contains("person", true) -> "注意！前方有人靠近"
-            label.contains("stair", true) -> "警告！前方有台阶"
-            else -> "注意！$label 接近"
+            label.contains("car", true) -> "Danger! Vehicle approaching ahead"
+            label.contains("person", true) -> "Caution! Person approaching"
+            label.contains("stair", true) -> "Warning! Stairs ahead"
+            else -> "Attention! $label nearby"
         }
         speak(warning)
+        showToast(warning)  // 显示 Toast 提示
     }
 
-    private fun speakObjectName(result: Detection) {
-        speak("检测到${result.categories[0].label}")
+    private fun speakObjectNameWithDirection(result: Detection) {
+        val label = result.categories[0].label
+        val direction = getDirection(result.boundingBox)
+        val message = "Detected $label $direction"
+        speak(message)
+        showToast(message)  // 显示 Toast 提示
+    }
+
+    private fun getDirection(boundingBox: RectF): String {
+        val screenWidth = binding.previewView.width
+        val screenHeight = binding.previewView.height
+        val centerX = screenWidth / 2
+        val centerY = screenHeight / 2
+
+        val boxCenterX = (boundingBox.left + boundingBox.right) / 2
+        val boxCenterY = (boundingBox.top + boundingBox.bottom) / 2
+
+        return when {
+            boxCenterX < centerX / 2 -> "on the far left"
+            boxCenterX > centerX * 3 / 2 -> "on the far right"
+            boxCenterY < centerY / 2 -> "above"
+            boxCenterY > centerY * 3 / 2 -> "below"
+            boxCenterX < centerX -> "on the left"
+            boxCenterX > centerX -> "on the right"
+            else -> "in the center"
+        }
     }
 
     private fun updateStatusUI(results: List<Detection>) {
         runOnUiThread {
-            val status = if (results.isEmpty()) "未检测到障碍物" else
-                "检测到：${results.joinToString { it.categories[0].label }}"
+            val status = if (results.isEmpty()) "No obstacles detected" else
+                "Detected: ${results.joinToString { it.categories[0].label }}"
             binding.statusText.text = status
         }
     }
@@ -234,27 +273,29 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, null)
     }
 
+    private fun showToast(message: String) {
+        runOnUiThread {
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            val result = tts.setLanguage(Locale.CHINESE)
+            val result = tts.setLanguage(Locale.US)
             isTtsReady = when (result) {
                 TextToSpeech.LANG_MISSING_DATA -> {
-                    showToast("缺少中文语音数据")
+                    showToast("Missing English speech data")
                     false
                 }
                 TextToSpeech.LANG_NOT_SUPPORTED -> {
-                    showToast("不支持中文语音")
+                    showToast("English language not supported")
                     false
                 }
                 else -> true
             }
         } else {
-            showToast("语音引擎初始化失败")
+            showToast("TTS engine initialization failed")
         }
-    }
-
-    private fun showToast(message: String) {
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     override fun onDestroy() {
