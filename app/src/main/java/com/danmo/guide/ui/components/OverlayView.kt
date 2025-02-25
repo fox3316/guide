@@ -1,4 +1,4 @@
-package com.danmo.guide
+package com.danmo.guide.ui.components
 
 import android.content.Context
 import android.graphics.Canvas

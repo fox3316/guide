@@ -21,6 +21,7 @@ tensorflowLiteGpu = "2.17.0"
 tensorflowLiteSupport = "0.4.4"
 tensorflowLiteTaskVision = "0.4.4"
 tensorflowLiteMetadata = "0.1.0"
+firebaseFirestoreKtx = "25.1.2"
 
 
 
@@ -55,6 +56,7 @@ tensorflow-lite-gpu = { module = "org.tensorflow:tensorflow-lite-gpu", version.r
 tensorflow-lite-support = { module = "org.tensorflow:tensorflow-lite-support", version.ref = "tensorflowLiteSupport" }
 tensorflow-lite-task-vision = { module = "org.tensorflow:tensorflow-lite-task-vision", version.ref = "tensorflowLiteTaskVision" }
 tensorflow-lite-metadata = { group = "org.tensorflow", name = "tensorflow-lite-metadata", version.ref = "tensorflowLiteMetadata" }
+firebase-firestore-ktx = { group = "com.google.firebase", name = "firebase-firestore-ktx", version.ref = "firebaseFirestoreKtx" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

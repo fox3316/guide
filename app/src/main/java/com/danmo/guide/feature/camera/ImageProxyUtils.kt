@@ -1,4 +1,4 @@
-package com.danmo.guide
+package com.danmo.guide.feature.camera
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
