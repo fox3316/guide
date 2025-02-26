@@ -96,12 +96,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 注册传感器监听（每秒更新一次）
         lightSensor?.let {
             sensorManager.registerListener(
                 lightSensorListener,
                 it,
-                SensorManager.SENSOR_DELAY_NORMAL
+                SensorManager.SENSOR_DELAY_UI // 使用更高的延迟
             )
         }
     }
@@ -127,19 +126,21 @@ class MainActivity : ComponentActivity() {
 
     private fun createAnalyzer(): ImageAnalysis.Analyzer {
         return ImageAnalysis.Analyzer { imageProxy ->
-            try {
-                val bitmap = ImageProxyUtils.toBitmap(imageProxy) ?: return@Analyzer
-                val tensorImage = TensorImage.fromBitmap(bitmap)
-                val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-                val results = objectDetectorHelper.detect(tensorImage, rotationDegrees)
+            cameraExecutor.submit {
+                try {
+                    val bitmap = ImageProxyUtils.toBitmap(imageProxy) ?: return@submit
+                    val tensorImage = TensorImage.fromBitmap(bitmap)
+                    val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+                    val results = objectDetectorHelper.detect(tensorImage, rotationDegrees)
 
-                updateOverlayView(results, rotationDegrees)
-                updateStatusUI(results)
-                handleDetectionResults(results, imageProxy)
-            } catch (e: Exception) {
-                Log.e("ImageAnalysis", "Error in image analysis", e)
-            } finally {
-                imageProxy.close()
+                    updateOverlayView(results, rotationDegrees)
+                    updateStatusUI(results)
+                    handleDetectionResults(results, imageProxy)
+                } catch (e: Exception) {
+                    Log.e("ImageAnalysis", "Error in image analysis", e)
+                } finally {
+                    imageProxy.close()
+                }
             }
         }
     }
@@ -163,36 +164,35 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @SuppressLint("SetTextI18n")
+    private var lastStatusUpdateTime = 0L // 上次更新状态的时间戳
+    private val statusUpdateInterval = 500L // 状态更新的时间间隔（毫秒）
+
     private fun updateStatusUI(results: List<Detection>) {
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastStatusUpdateTime < statusUpdateInterval) return
+        lastStatusUpdateTime = currentTime
+
+        val filtered = results.filter { detection ->
+            (detection.categories.maxByOrNull { it.score }?.let { it.score >= FeedbackManager.CONFIDENCE_THRESHOLD } ?: false)
+        }
+
         runOnUiThread {
-            val filtered = results.filter { detection ->
-                detection.categories
-                    .maxByOrNull { it.score }
-                    ?.let { it.score >= FeedbackManager.CONFIDENCE_THRESHOLD }
-                    ?: false
-
-            }
-
-
             binding.statusText.text = if (filtered.isEmpty()) {
                 "未检测到有效障碍物"
             } else {
-                "检测到: ${
-                    filtered.joinToString { detection ->
-                        detection.categories.maxByOrNull { it.score }?.let { category ->
-                            "${getChineseLabel(category.label)} (${"%.1f%%".format(category.score * 100)})"
-                        } ?: "未知物体"
-                    }
-                }"
+                "检测到: ${filtered.joinToString { detection ->
+                    detection.categories.maxByOrNull { it.score }?.let { category ->
+                        "${getChineseLabel(category.label)} (${String.format("%.1f%%", category.score * 100)})"
+                    } ?: "未知物体"
+                }}"
             }
+            val lightStatus = if (lastLightValue < LIGHT_THRESHOLD) {
+                "[低光环境]"
+            } else {
+                "[光线正常]"
+            }
+            binding.statusText.text = "$lightStatus ${binding.statusText.text}"
         }
-        val lightStatus = if (lastLightValue < LIGHT_THRESHOLD) {
-            "[低光环境]"
-        } else {
-            "[光线正常]"
-        }
-        binding.statusText.text = "$lightStatus ${binding.statusText.text}"
     }
 
     private fun getChineseLabel(originalLabel: String): String {

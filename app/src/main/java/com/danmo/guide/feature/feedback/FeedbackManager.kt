@@ -2,75 +2,402 @@ package com.danmo.guide.feature.feedback
 
 import android.content.Context
 import android.graphics.RectF
-import android.os.Build
-import android.os.Handler
-import android.os.Looper
-import android.os.VibrationEffect
-import android.os.Vibrator
+import android.os.*
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import android.widget.Toast
 import org.tensorflow.lite.task.vision.detector.Detection
-import java.util.Locale
+import java.util.*
+import kotlin.collections.LinkedHashMap
+import kotlin.math.pow
+import kotlin.math.sqrt
 
 class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
-    private val context = context
+    private val context: Context = context.applicationContext
     private var tts: TextToSpeech = TextToSpeech(context, this)
-    private var vibrator: Vibrator? = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
+    private val vibrator: Vibrator? =
+        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
     private var isTtsReady = false
-    private var lastSpeakTime = 0L
-    private val speakCooldown = 3000L
+    private var lastVibrationTime = 0L
+
+    // 消息优先级系统
+    private enum class MsgPriority { CRITICAL, HIGH, NORMAL }
+    private data class SpeechItem(
+        val text: String,
+        val priority: MsgPriority,
+        val vibrationPattern: LongArray? = null,
+        val id: String = UUID.randomUUID().toString()
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (javaClass != other?.javaClass) return false
+
+            other as SpeechItem
+
+            if (text != other.text) return false
+            if (priority != other.priority) return false
+            if (vibrationPattern != null) {
+                if (other.vibrationPattern == null) return false
+                if (!vibrationPattern.contentEquals(other.vibrationPattern)) return false
+            } else if (other.vibrationPattern != null) return false
+            if (id != other.id) return false
+
+            return true
+        }
+
+        override fun hashCode(): Int {
+            var result = text.hashCode()
+            result = 31 * result + priority.hashCode()
+            result = 31 * result + (vibrationPattern?.contentHashCode() ?: 0)
+            result = 31 * result + id.hashCode()
+            return result
+        }
+    }
+
+    // 队列管理系统
+    private val speechQueue = LinkedHashMap<String, SpeechItem>()
+    private var currentSpeechId: String? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private val cooldownMap = mutableMapOf<String, Long>()
+    private val activeMessages = mutableSetOf<String>()
+
+    private val warningTemplates = listOf(
+        { label: String -> "注意！正前方发现$label，请小心" },
+        { label: String -> "危险！$label，接近中" },  // 移除多余的+
+        { label: String -> "请留意，附近有$label" }
+    )
+
+    private val directionTemplates = listOf(
+        { label: String, dir: String -> "您的${dir}方向有$label" },
+        { label: String, dir: String -> "检测到${dir}存在$label" },
+        { label: String, dir: String -> "$label，位于${dir}方位" }
+    )
+
+    private val distanceAdverbs = mapOf(
+        "NEAR" to listOf("非常接近", "距离很近", "就在附近"),
+        "MID" to listOf("约三米处", "前方中等距离", "稍远位置"),
+        "FAR" to listOf("较远位置", "远处方向", "远端区域")
+    )
+
+    // 上下文记忆系统
+    private data class ObjectContext(
+        var lastReportTime: Long = 0,
+        var reportCount: Int = 0,
+        var lastDirection: String = ""
+    )
+
+    private val contextMemory = mutableMapOf<String, ObjectContext>()
+
+    companion object {
+        private const val MIN_COOLDOWN = 3000L
+        private const val PRIORITY_COOLDOWN = 1500L
+        const val CONFIDENCE_THRESHOLD = 0.4f
+        private val DANGEROUS_LABELS = setOf("car", "person", "bus", "truck")
+        private const val DANGEROUS_SIZE_RATIO = 0.25f
+        private const val MEMORY_TIMEOUT = 30000L
+    }
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            val result = tts.setLanguage(Locale.US)
-            isTtsReady = when {
-                result == TextToSpeech.LANG_MISSING_DATA -> {
-                    Log.w("TTS", "Missing language data")
+            val result = tts.setLanguage(Locale.CHINESE)
+            isTtsReady = when (result) {
+                TextToSpeech.LANG_MISSING_DATA -> {
+                    Log.w("TTS", "缺少中文语言数据")
                     false
                 }
-                result == TextToSpeech.LANG_NOT_SUPPORTED -> {
-                    Log.w("TTS", "Language not supported")
+
+                TextToSpeech.LANG_NOT_SUPPORTED -> {
+                    Log.w("TTS", "不支持中文语音")
                     false
                 }
-                else -> true
+
+                else -> {
+                    tts.setOnUtteranceProgressListener(utteranceListener)
+                    true
+                }
             }
         } else {
-            Log.e("TTS", "Initialization failed")
+            Log.e("TTS", "语音引擎初始化失败")
         }
     }
 
-    companion object {
-        const val CONFIDENCE_THRESHOLD = 0.4f // 40%置信度阈值
+    private val utteranceListener = object : UtteranceProgressListener() {
+        override fun onStart(utteranceId: String?) {
+            currentSpeechId = utteranceId
+            handler.post {
+                speechQueue.remove(utteranceId)?.let { item ->
+                    triggerVibration(item)
+                    activeMessages.remove(item.text)
+                }
+            }
+        }
+
+        override fun onDone(utteranceId: String?) {
+            handler.post {
+                currentSpeechId = null
+                processNextInQueue()
+            }
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onError(utteranceId: String?) {
+            handler.post {
+                currentSpeechId = null
+                processNextInQueue()
+                Log.e("TTS", "语音播报失败: $utteranceId")
+            }
+        }
     }
 
-
-    // 修改处理检测结果的方法
     fun handleDetectionResult(result: Detection, previewWidth: Int, previewHeight: Int) {
         if (!isTtsReady) return
 
-        // 获取最高置信度类别
-        val topCategory = result.categories.maxByOrNull { it.score } ?: return
-        if (topCategory.score < CONFIDENCE_THRESHOLD) return // 过滤低置信度结果
+        result.categories.maxByOrNull { it.score }?.let { category ->
+            if (category.score < CONFIDENCE_THRESHOLD) return@let
 
-        val currentTime = System.currentTimeMillis()
-        if (currentTime - lastSpeakTime < speakCooldown) return
+            val label = getChineseLabel(category.label)
+            val message = buildDetectionMessage(result, previewWidth, previewHeight, label)
+            message?.let { queueMessage(it, determinePriority(category.label)) }
+        }
+    }
 
-        when {
-            isDangerousDistance(result, previewWidth, previewHeight) -> {
-                speakSafetyWarning(result)
-                vibrate(500)
+    private fun buildDetectionMessage(
+        result: Detection,
+        width: Int,
+        height: Int,
+        label: String
+    ): String? {
+        return when {
+            isDangerousObject(result, width, height) ->
+                generateCriticalAlert(label)
+
+            shouldSuppressMessage(label) ->
+                null
+
+            else ->
+                generateDirectionalMessage(result.boundingBox, width, height, label)
+        }
+    }
+
+    private fun isDangerousObject(result: Detection, width: Int, height: Int): Boolean {
+        val box = result.boundingBox
+        val boxArea = (box.right - box.left) * (box.bottom - box.top)
+        return boxArea > width * height * DANGEROUS_SIZE_RATIO
+    }
+
+    private fun generateCriticalAlert(label: String): String {
+        return warningTemplates.random()(label)
+    }
+
+    private fun generateDirectionalMessage(
+        box: RectF,
+        width: Int,
+        height: Int,
+        label: String
+    ): String? {
+        val (direction, distance) = calculateDirection(box, width, height)
+        val context = contextMemory.getOrPut(label) { ObjectContext() }
+
+        return if (shouldReport(context, direction)) {
+            context.update(direction)
+            directionTemplates.random()(label, "$direction${getDistanceAdverb(distance)}")
+        } else {
+            null
+        }
+    }
+
+    private fun calculateDirection(box: RectF, width: Int, height: Int): Pair<String, String> {
+        val centerX = width / 2f
+        val centerY = height / 2f
+        val boxCenterX = (box.left + box.right) / 2
+        val boxCenterY = (box.top + box.bottom) / 2
+
+        // 三维距离计算
+        val screenDiagonal = sqrt(width.toDouble().pow(2) + height.toDouble().pow(2))
+        val boxDiagonal = sqrt(box.width().toDouble().pow(2) + box.height().toDouble().pow(2))
+        val distance = when (boxDiagonal / screenDiagonal) {
+            in 0.3..1.0 -> "NEAR"
+            in 0.1..0.3 -> "MID"
+            else -> "FAR"
+        }
+
+        // 九宫格方向判断
+        val direction = when {
+            boxCenterX < centerX * 0.4 && boxCenterY < centerY * 0.4 -> "左前方"
+            boxCenterX > centerX * 1.6 && boxCenterY < centerY * 0.4 -> "右前方"
+            boxCenterX < centerX * 0.4 && boxCenterY > centerY * 1.6 -> "左后方"
+            boxCenterX > centerX * 1.6 && boxCenterY > centerY * 1.6 -> "右后方"
+            boxCenterX < centerX -> "左侧"
+            boxCenterX > centerX -> "右侧"
+            else -> "正前方"
+        }
+
+        return direction to distance
+    }
+
+    private fun shouldReport(context: ObjectContext, newDirection: String): Boolean {
+        val timeElapsed = System.currentTimeMillis() - context.lastReportTime
+        return when {
+            timeElapsed > MEMORY_TIMEOUT -> true
+            context.lastDirection != newDirection -> true
+            context.reportCount < 3 -> true
+            else -> false
+        }
+    }
+
+    private fun ObjectContext.update(newDirection: String) {
+        lastReportTime = System.currentTimeMillis()
+        reportCount = (reportCount % 2) + 1
+        lastDirection = newDirection
+    }
+
+    private fun getDistanceAdverb(distance: String) =
+        distanceAdverbs[distance]?.random() ?: ""
+
+    private fun determinePriority(label: String) = when {
+        label in DANGEROUS_LABELS -> MsgPriority.HIGH
+        else -> MsgPriority.NORMAL
+    }
+
+    private fun shouldSuppressMessage(label: String) =
+        label == "unknown" || label.contains("背景")
+
+    // 队列管理系统
+    private fun queueMessage(message: String, priority: MsgPriority) {
+        val now = System.currentTimeMillis()
+
+        if (cooldownMap[message]?.let { now - it < MIN_COOLDOWN } == true) return
+        if (activeMessages.contains(message)) return
+        if (priority == MsgPriority.CRITICAL && now - (cooldownMap.values.maxOrNull()
+                ?: 0) < PRIORITY_COOLDOWN
+        ) return
+
+        val item = SpeechItem(
+            text = message,
+            priority = priority,
+            vibrationPattern = when (priority) {
+                MsgPriority.CRITICAL -> longArrayOf(0, 500, 200, 300)
+                MsgPriority.HIGH -> longArrayOf(0, 200)
+                else -> null
             }
-            else -> {
-                speakObjectNameWithDirection(result, previewWidth, previewHeight)
-                vibrate(200)
+        )
+
+        manageQueue(item)
+        cooldownMap[message] = now
+        activeMessages.add(message)
+    }
+
+    private fun manageQueue(item: SpeechItem) {
+        when (item.priority) {
+            MsgPriority.CRITICAL -> {
+                speechQueue.clear()
+                speechQueue[item.id] = item
+                interruptCurrentSpeech()
+            }
+
+            MsgPriority.HIGH -> {
+                speechQueue.values.removeAll { it.priority == MsgPriority.NORMAL }
+                speechQueue[item.id] = item
+                if (currentSpeechId == null) processNextInQueue()
+            }
+
+            MsgPriority.NORMAL -> {
+                if (!speechQueue.values.any { it.text == item.text }) {
+                    speechQueue[item.id] = item
+                    if (currentSpeechId == null) processNextInQueue()
+                }
             }
         }
-        lastSpeakTime = currentTime
+    }
+
+    private fun processNextInQueue() {
+        if (currentSpeechId != null || speechQueue.isEmpty()) return
+
+        val item = speechQueue.values.maxWith(
+            compareBy(
+                { it.priority.ordinal },
+                { -speechQueue.keys.indexOf(it.id) }
+            )
+        )
+        item.let {
+            speechQueue.remove(it.id)
+            speak(it)
+        }
+    }
+
+    private fun speak(item: SpeechItem) {
+        try {
+            // 新版本保留基础参数
+            val params = Bundle().apply {
+                putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, item.id)
+                putInt(TextToSpeech.Engine.KEY_PARAM_PAN, calculatePan(item.text))
+            }
+            tts.speak(item.text, TextToSpeech.QUEUE_ADD, params, item.id)
+
+            // 全局语速设置（影响后续所有语音）
+            tts.setSpeechRate(1.1f.takeIf { item.priority == MsgPriority.CRITICAL } ?: 0.9f)
+
+            showToast(item.text)
+        } catch (e: IllegalStateException) {
+            Log.e("TTS", "播报失败", e)
+            processNextInQueue()
+        }
     }
 
 
-    // 在 FeedbackManager 类中添加标签映射
+    private fun interruptCurrentSpeech() {
+        currentSpeechId?.let {
+            try {
+                tts.stop()
+            } catch (e: IllegalStateException) {
+                Log.e("TTS", "中断当前语音失败", e)
+            }
+            currentSpeechId = null
+        }
+        processNextInQueue()
+    }
+
+    private fun triggerVibration(item: SpeechItem) {
+        if (System.currentTimeMillis() - lastVibrationTime < 1000) return
+
+        item.vibrationPattern?.let { pattern ->
+            vibrator?.let {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        it.vibrate(VibrationEffect.createWaveform(pattern, -1))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        it.vibrate(pattern, -1)
+                    }
+                    lastVibrationTime = System.currentTimeMillis()
+                } catch (e: Exception) {
+                    Log.e("Vibration", "振动反馈失败", e)
+                }
+            }
+        }
+    }
+
+    private fun showToast(message: String) {
+        handler.post {
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun shutdown() {
+        try {
+            tts.stop()
+            tts.shutdown()
+        } catch (e: IllegalStateException) {
+            Log.e("TTS", "关闭语音引擎失败", e)
+        }
+        handler.removeCallbacksAndMessages(null)
+        speechQueue.clear()
+        activeMessages.clear()
+        contextMemory.clear()
+    }
+
+    // 中文标签系统（完整版）
     private val labelTranslations = mapOf(
         "person" to "行人",
         "bicycle" to "自行车",
@@ -81,12 +408,12 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
         "train" to "火车",
         "truck" to "卡车",
         "boat" to "船只",
-        "traffic light" to "交通信号灯",
+        "traffic light" to "交通灯",
         "fire hydrant" to "消防栓",
         "stop sign" to "停车标志",
         "parking meter" to "停车计时器",
         "bench" to "长椅",
-        "bird" to "鸟",
+        "bird" to "鸟类",
         "cat" to "猫",
         "dog" to "狗",
         "horse" to "马",
@@ -103,7 +430,7 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
         "suitcase" to "行李箱",
         "frisbee" to "飞盘",
         "skis" to "滑雪板",
-        "snowboard" to "单板滑雪板",
+        "snowboard" to "滑雪单板",
         "sports ball" to "运动球类",
         "kite" to "风筝",
         "baseball bat" to "棒球棒",
@@ -112,10 +439,10 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
         "surfboard" to "冲浪板",
         "tennis racket" to "网球拍",
         "bottle" to "瓶子",
-        "wine glass" to "红酒杯",
+        "wine glass" to "酒杯",
         "cup" to "杯子",
         "fork" to "叉子",
-        "knife" to "刀",
+        "knife" to "刀具",
         "spoon" to "勺子",
         "bowl" to "碗",
         "banana" to "香蕉",
@@ -135,7 +462,7 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
         "dining table" to "餐桌",
         "toilet" to "马桶",
         "tv" to "电视",
-        "laptop" to "笔记本电脑",
+        "laptop" to "笔记本",
         "mouse" to "鼠标",
         "remote" to "遥控器",
         "keyboard" to "键盘",
@@ -149,92 +476,33 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
         "clock" to "时钟",
         "vase" to "花瓶",
         "scissors" to "剪刀",
-        "teddy bear" to "泰迪熊",
+        "teddy bear" to "玩偶",
         "hair drier" to "吹风机",
-        "toothbrush" to "牙刷"
+        "toothbrush" to "牙刷",
+        "door" to "门",
+        "window" to "窗户",
+        "stairs" to "楼梯",
+        "curtain" to "窗帘",
+        "mirror" to "镜子"
     )
 
-    // 修改获取标签的方法
-    fun getChineseLabel(originalLabel: String): String {
-        return labelTranslations[originalLabel.toLowerCase()] ?: "未知物体"
+    fun getChineseLabel(original: String): String {
+        val normalized = original
+            .lowercase(Locale.ROOT)
+            .replace(Regex("[^a-z ]"), "")
+            .trim()
+
+        return labelTranslations[normalized] ?: normalized.split(" ")
+            .joinToString("") { part ->
+                labelTranslations[part] ?: part
+            }.takeIf { it.isNotBlank() } ?: "物体"
     }
 
-    private fun isDangerousDistance(result: Detection, width: Int, height: Int): Boolean {
-        val boxArea = result.boundingBox.width() * result.boundingBox.height()
-        val screenArea = width * height
-        return boxArea > 0.25f * screenArea
-    }
-
-    private fun speakSafetyWarning(result: Detection) {
-        val category = result.categories.firstOrNull()
-        val originalLabel = category?.label ?: "unknown"
-        val label = getChineseLabel(originalLabel) // 转换为中文
-
-        val warning = when {
-            originalLabel.equals("car", true) -> "危险！前方有汽车接近" // 保持原始判断逻辑
-            originalLabel.equals("person", true) -> "注意！前方有行人"
-            originalLabel.equals("stair", true) -> "警告！前方有楼梯"
-            else -> "请注意！附近有$label"
-        }
-        speak(warning)
-        showToast(warning)
-    }
-
-    private fun speakObjectNameWithDirection(result: Detection, width: Int, height: Int) {
-        val category = result.categories.firstOrNull()
-        val originalLabel = category?.label ?: "unknown"
-        val label = getChineseLabel(originalLabel) // 转换为中文
-
-        val direction = getDirection(result.boundingBox, width, height)
-        val message = "检测到${label}在${direction}"
-        speak(message)
-        showToast(message)
-    }
-
-    private fun getDirection(boundingBox: RectF, width: Int, height: Int): String {
-        val centerX = width / 2
-        val centerY = height / 2
-        val boxCenterX = (boundingBox.left + boundingBox.right) / 2
-        val boxCenterY = (boundingBox.top + boundingBox.bottom) / 2
-
+    private fun calculatePan(text: String): Int {
         return when {
-            boxCenterX < centerX / 2 -> "左侧远处"
-            boxCenterX > centerX * 3 / 2 -> "右侧远处"
-            boxCenterY < centerY / 2 -> "上方"
-            boxCenterY > centerY * 3 / 2 -> "下方"
-            boxCenterX < centerX -> "左侧"
-            boxCenterX > centerX -> "右侧"
-            else -> "正前方"
+            text.contains("左") -> -1 // 左声道
+            text.contains("右") -> 1  // 右声道
+            else -> 0               // 居中
         }
-    }
-
-
-    private fun speak(text: String) {
-        try {
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, null)
-        } catch (e: IllegalStateException) {
-            Log.e("TTS", "Error speaking text", e)
-        }
-    }
-
-    private fun vibrate(durationMs: Long) {
-        vibrator?.let {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                it.vibrate(VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE))
-            } else {
-                @Suppress("DEPRECATION")
-                it.vibrate(durationMs)
-            }
-        }
-    }
-
-    private fun showToast(message: String) {
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    fun shutdown() {
-        tts.shutdown()
     }
 }
