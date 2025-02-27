@@ -2,4 +2,10 @@
 <resources>
 
     <style name="Theme.Guide" parent="android:Theme.Material.Light.NoActionBar" />
+    <!-- 闪屏页专用主题 -->
+    <style name="SplashTheme" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="windowNoTitle">true</item>
+    </style>
 </resources>

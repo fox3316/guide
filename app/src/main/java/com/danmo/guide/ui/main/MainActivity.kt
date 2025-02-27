@@ -167,6 +167,7 @@ class MainActivity : ComponentActivity() {
     private var lastStatusUpdateTime = 0L // 上次更新状态的时间戳
     private val statusUpdateInterval = 500L // 状态更新的时间间隔（毫秒）
 
+    @SuppressLint("DefaultLocale", "SetTextI18n")
     private fun updateStatusUI(results: List<Detection>) {
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastStatusUpdateTime < statusUpdateInterval) return

@@ -64,7 +64,7 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
 
     private val warningTemplates = listOf(
         { label: String -> "注意！正前方发现$label，请小心" },
-        { label: String -> "危险！$label，接近中" },  // 移除多余的+
+        { label: String -> "危险！$label，接近中" },
         { label: String -> "请留意，附近有$label" }
     )
 

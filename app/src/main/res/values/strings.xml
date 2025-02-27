@@ -1,3 +1,5 @@
 <resources>
-    <string name="app_name">guide</string>
+    <string name="app_name">光迹</string>
+    <string name="slogan_text">科技不是高高在上\n而是服务每一个人</string>
+    <string name="loading_text">加载中…</string>
 </resources>
