@@ -13,7 +13,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
 import androidx.core.content.ContextCompat
 import com.danmo.guide.databinding.ActivityMainBinding
 import com.danmo.guide.feature.camera.CameraManager
@@ -142,7 +141,7 @@ class MainActivity : ComponentActivity() {
 
                     updateOverlayView(results, rotationDegrees)
                     updateStatusUI(results)
-                    handleDetectionResults(results, imageProxy)
+                    handleDetectionResults(results)
                 } catch (e: Exception) {
                     Log.e("ImageAnalysis", "Error in image analysis", e)
                 } finally {
@@ -152,15 +151,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun handleDetectionResults(results: List<Detection>, imageProxy: ImageProxy) {
+    private fun handleDetectionResults(results: List<Detection>) {
         // 正确获取最高分结果
         results.maxByOrNull {
             it.categories.firstOrNull()?.score ?: 0f  // 获取第一个类别的分数
         }?.let { topResult ->
             feedbackManager.handleDetectionResult(
-                topResult,
-                imageProxy.width,
-                imageProxy.height
+                topResult
             )
         }
     }

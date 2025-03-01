@@ -1,7 +1,9 @@
 package com.danmo.guide.feature.feedback
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.RectF
+import android.media.AudioManager
 import android.os.*
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -9,529 +11,430 @@ import android.util.Log
 import android.widget.Toast
 import org.tensorflow.lite.task.vision.detector.Detection
 import java.util.*
-import kotlin.collections.LinkedHashMap
-import kotlin.math.pow
-import kotlin.math.sqrt
+import java.util.concurrent.*
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+import kotlin.math.max
+import kotlin.math.min
 
 class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
-    private val context: Context = context.applicationContext // 使用应用上下文
+
+    // 初始化上下文和硬件组件
+    private val context: Context = context.applicationContext
     private var tts: TextToSpeech = TextToSpeech(context, this)
     private val vibrator: Vibrator? by lazy {
-        context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+        } else {
+            @Suppress("DEPRECATION") context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
     }
     private var isTtsReady = false
-    private var lastVibrationTime = 0L
 
-    // 确保震动器可用性检查
-    private fun isVibrationAvailable(): Boolean {
-        return vibrator?.hasVibrator() ?: false
-    }
-    // 消息优先级系统
+    // 语音消息优先级系统
     private enum class MsgPriority { CRITICAL, HIGH, NORMAL }
+
+    // 语音消息数据结构
     private data class SpeechItem(
         val text: String,
-        val priority: MsgPriority,
+        val direction: String,
+        val basePriority: MsgPriority,
+        val label: String, // 新增label字段
+        val timestamp: Long = System.currentTimeMillis(),
         val vibrationPattern: LongArray? = null,
         val id: String = UUID.randomUUID().toString()
-    ) {
-        override fun equals(other: Any?): Boolean {
-            if (this === other) return true
-            if (javaClass != other?.javaClass) return false
+    ) : Comparable<SpeechItem> {
 
-            other as SpeechItem
+        private val ageFactor: Float get() =
+            1 - (System.currentTimeMillis() - timestamp).coerceAtMost(5000L) / 5000f
 
-            if (text != other.text) return false
-            if (priority != other.priority) return false
-            if (vibrationPattern != null) {
-                if (other.vibrationPattern == null) return false
-                if (!vibrationPattern.contentEquals(other.vibrationPattern)) return false
-            } else if (other.vibrationPattern != null) return false
-            if (id != other.id) return false
-
-            return true
+        val dynamicPriority: Int get() = when (basePriority) {
+            MsgPriority.CRITICAL -> (1000 * ageFactor).toInt()
+            MsgPriority.HIGH -> (800 * ageFactor).toInt()
+            MsgPriority.NORMAL -> (500 * ageFactor).toInt()
         }
 
-        override fun hashCode(): Int {
-            var result = text.hashCode()
-            result = 31 * result + priority.hashCode()
-            result = 31 * result + (vibrationPattern?.contentHashCode() ?: 0)
-            result = 31 * result + id.hashCode()
-            return result
-        }
+        override fun compareTo(other: SpeechItem): Int = other.dynamicPriority.compareTo(this.dynamicPriority)
+        // 修改1：增强消息唯一性判断条件
+        override fun equals(other: Any?): Boolean = (other as? SpeechItem)?.let {
+            // 同时校验label、direction和消息文本
+            label == it.label && direction == it.direction && text == it.text
+        } ?: false
+
+
+        override fun hashCode(): Int = label.hashCode() + 31 * direction.hashCode()
     }
 
-    // 队列管理系统
-    private val speechQueue = LinkedHashMap<String, SpeechItem>()
+    // 并发管理组件
+    private val speechQueue = PriorityBlockingQueue<SpeechItem>()
+    private val executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var currentSpeechId: String? = null
-    private val handler = Handler(Looper.getMainLooper())
-    private val cooldownMap = mutableMapOf<String, Long>()
-    private val activeMessages = mutableSetOf<String>()
 
-    private val warningTemplates = listOf(
-        { label: String -> "注意！正前方发现$label，请小心" },
-        { label: String -> "危险！$label，接近中" },
-        { label: String -> "请留意，附近有$label" }
-    )
-
-    private val directionTemplates = listOf(
-        { label: String, dir: String -> "您的${dir}方向有$label" },
-        { label: String, dir: String -> "检测到${dir}存在$label" },
-        { label: String, dir: String -> "$label，位于${dir}方位" }
-    )
-
-    private val distanceAdverbs = mapOf(
-        "NEAR" to listOf("非常接近", "距离很近", "就在附近"),
-        "MID" to listOf("约三米处", "前方中等距离", "稍远位置"),
-        "FAR" to listOf("较远位置", "远处方向", "远端区域")
-    )
+    // 批处理系统
+    private val pendingDetections = ConcurrentLinkedQueue<Detection>()
+    private val batchProcessor = Executors.newSingleThreadScheduledExecutor()
 
     // 上下文记忆系统
     private data class ObjectContext(
         var lastReportTime: Long = 0,
-        var reportCount: Int = 0,
-        var lastDirection: String = ""
+        var speedFactor: Float = 1.0f
     )
+    private val contextMemory = ConcurrentHashMap<String, ObjectContext>()
 
-    private val contextMemory = mutableMapOf<String, ObjectContext>()
+    // 新增：最近消息记录和同步锁
+    private val recentMessages = ConcurrentHashMap<String, Long>()
+    private val queueLock = ReentrantLock()
 
     companion object {
-        private const val MIN_COOLDOWN = 3000L
-        private const val PRIORITY_COOLDOWN = 1500L
+        private const val BATCH_INTERVAL_MS = 50L
+        private const val MIN_REPORT_INTERVAL_MS = 800L
         const val CONFIDENCE_THRESHOLD = 0.4f
         private val DANGEROUS_LABELS = setOf("car", "person", "bus", "truck")
-        private const val DANGEROUS_SIZE_RATIO = 0.25f
-        private const val MEMORY_TIMEOUT = 30000L
+    }
+
+
+    init {
+        // 初始化设备特定设置
+        executor.execute {
+            // 华为设备引擎设置（需要API Level 21+）
+            if (Build.MANUFACTURER.equals("HUAWEI", ignoreCase = true)) {
+                try {
+                    tts = TextToSpeech(context, this@FeedbackManager, "com.huawei.hiai.engineservice.tts")
+                } catch (e: Exception) {
+                    Log.e("TTS", "华为引擎初始化失败", e)
+                }
+            }
+        }
+
+        // 启动批处理任务
+        batchProcessor.scheduleWithFixedDelay(
+            ::processBatch,
+            0, BATCH_INTERVAL_MS, TimeUnit.MILLISECONDS
+        )
     }
 
     override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            val result = tts.setLanguage(Locale.CHINESE)
-            isTtsReady = when (result) {
-                TextToSpeech.LANG_MISSING_DATA -> {
-                    Log.w("TTS", "缺少中文语言数据")
-                    false
+        executor.submit {
+            when {
+                status == TextToSpeech.SUCCESS -> {
+                    setupTTS()
+                    processNextInQueue() // 初始化完成后触发队列处理
                 }
-
-                TextToSpeech.LANG_NOT_SUPPORTED -> {
-                    Log.w("TTS", "不支持中文语音")
-                    false
-                }
-
-                else -> {
-                    tts.setOnUtteranceProgressListener(utteranceListener)
-                    true
-                }
+                else -> showToast("语音功能初始化失败", true)
             }
-        } else {
-            Log.e("TTS", "语音引擎初始化失败")
         }
     }
 
+    private fun setupTTS() {
+        when (tts.setLanguage(Locale.CHINESE)) {
+            TextToSpeech.LANG_MISSING_DATA -> handleMissingLanguageData()
+            TextToSpeech.LANG_NOT_SUPPORTED -> showToast("不支持中文语音", true)
+            else -> {
+                tts.setOnUtteranceProgressListener(utteranceListener)
+                isTtsReady = true
+                Log.d("TTS", "语音引擎初始化成功")
+            }
+        }
+    }
+
+    private fun handleMissingLanguageData() {
+        showToast("缺少中文语音数据", true)
+        try {
+            val intent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
+            intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Log.e("TTS", "无法启动语音数据安装", e)
+        }
+    }
+
+    // region 语音处理逻辑
     private val utteranceListener = object : UtteranceProgressListener() {
         override fun onStart(utteranceId: String?) {
             currentSpeechId = utteranceId
-            handler.post {
-                speechQueue.remove(utteranceId)?.let { item ->
-                    // 立即触发震动
-                    triggerVibration(item)
-                    activeMessages.remove(item.text)
-                }
-            }
         }
 
         override fun onDone(utteranceId: String?) {
-            handler.post {
-                currentSpeechId = null
-                processNextInQueue()
-                //添加延迟保证震动完成
-                handler.postDelayed({ processNextInQueue() }, 300)
+            executor.submit {
+                if (currentSpeechId == utteranceId) { // 增加ID匹配校验
+                    currentSpeechId = null
+                    processNextInQueue()
+                }
             }
         }
 
         @Deprecated("Deprecated in Java")
         override fun onError(utteranceId: String?) {
-            handler.post {
-                currentSpeechId = null
+            executor.submit {
+                currentSpeechId = null // 清除当前ID
                 processNextInQueue()
-                Log.e("TTS", "语音播报失败: $utteranceId")
             }
         }
     }
 
-    fun handleDetectionResult(result: Detection, previewWidth: Int, previewHeight: Int) {
-        if (!isTtsReady) return
-
-        result.categories.maxByOrNull { it.score }?.let { category ->
-            if (category.score < CONFIDENCE_THRESHOLD) return@let
-
-            val label = getChineseLabel(category.label)
-            val message = buildDetectionMessage(result, previewWidth, previewHeight, label)
-            message?.let { queueMessage(it, determinePriority(category.label)) }
-        }
+    fun handleDetectionResult(result: Detection) {
+        pendingDetections.add(result)
     }
 
-    private fun buildDetectionMessage(
-        result: Detection,
-        width: Int,
-        height: Int,
-        label: String
-    ): String? {
+    private fun processBatch() {
+        val batch = mutableListOf<Detection>().apply {
+            while (pendingDetections.isNotEmpty()) pendingDetections.poll()?.let { add(it) }
+        }
+        val mergedDetections = mergeDetections(batch)  // 明确接收合并结果
+        mergedDetections.forEach { processSingleDetection(it) }
+    }
+    // endregion
+
+    // region 核心业务逻辑
+    private fun mergeDetections(detections: List<Detection>): List<Detection> {
+        // 增加面积重叠率计算
+        fun overlapRatio(a: RectF, b: RectF): Float {
+            val interArea = max(0f, min(a.right, b.right) - max(a.left, b.left)) *
+                    max(0f, min(a.bottom, b.bottom) - max(a.top, b.top))
+            val unionArea = a.width() * a.height() + b.width() * b.height() - interArea
+            return if (unionArea > 0) interArea / unionArea else 0f
+        }
+
+        val merged = mutableListOf<Detection>()  // 修复1：显式声明合并列表
+        detections.sortedByDescending { it.boundingBox.width() }.forEach { detection ->
+            // 修复2：正确引用merged变量
+            if (merged.none { existing ->
+                    overlapRatio(existing.boundingBox, detection.boundingBox) > 0.6 &&
+                            existing.categories.any { it.label == detection.categories.first().label }
+                }) {
+                merged.add(detection)
+            }
+        }
+        return merged
+    }
+
+    private fun processSingleDetection(result: Detection) {
+        if (!checkTtsHealth()) return
+
+        result.categories.maxByOrNull { it.score }
+            ?.takeIf { it.score >= CONFIDENCE_THRESHOLD }
+            ?.let { category ->
+                val label = getChineseLabel(category.label)
+                buildDetectionMessage(result, label)?.let { (message, dir, pri, lbl) ->
+                    mainHandler.post { enqueueMessage(message, dir, pri, lbl) } // 添加第四个参数
+                }
+            }
+    }
+
+    // 新增：构建检测消息方法
+    private fun buildDetectionMessage(result: Detection, label: String): Quadruple<String, String, MsgPriority, String>? {
+        if (shouldSuppressMessage(label)) return null
+
+        val context = contextMemory.compute(label) { _, v ->
+            v?.apply { speedFactor = max(0.5f, speedFactor * 0.9f) } ?: ObjectContext()
+        }!!
+
         return when {
-            isDangerousObject(result, width, height) ->
-                generateCriticalAlert(label)
-
-            shouldSuppressMessage(label) ->
-                null
-
-            else ->
-                generateDirectionalMessage(result.boundingBox, width, height, label)
+            isCriticalDetection(result) -> Quadruple(
+                generateCriticalAlert(label),
+                "center",
+                MsgPriority.CRITICAL,
+                label
+            )
+            shouldReport(context, generateDirectionMessage(label, calculateDirection(result.boundingBox))) -> {
+                context.lastReportTime = System.currentTimeMillis()
+                context.speedFactor = min(2.0f, context.speedFactor * 1.1f)
+                Quadruple(
+                    generateDirectionMessage(label, calculateDirection(result.boundingBox)),
+                    "general",
+                    MsgPriority.HIGH,
+                    label
+                )
+            }
+            else -> null
         }
     }
 
-    private fun isDangerousObject(result: Detection, width: Int, height: Int): Boolean {
-        val box = result.boundingBox
-        val boxArea = (box.right - box.left) * (box.bottom - box.top)
-        return boxArea > width * height * DANGEROUS_SIZE_RATIO
-    }
+    // 定义四元组类型
+    private data class Quadruple<out A, out B, out C, out D>(
+        val first: A,
+        val second: B,
+        val third: C,
+        val fourth: D
+    )
 
+    private fun checkTtsHealth(): Boolean {
+        val isHealthy = isTtsReady && tts.voices?.any { it.locale == Locale.CHINESE } == true
+        if (!isHealthy) showToast("语音引擎未就绪", true)
+        return isHealthy
+    }
+    // endregion
+
+    // region 语音生成逻辑
     private fun generateCriticalAlert(label: String): String {
-        return warningTemplates.random()(label)
+        val templates = listOf("注意！正前方发现$label", "危险！$label,接近中", "紧急！$label,靠近")
+        return templates.random()
     }
 
-    private fun generateDirectionalMessage(
-        box: RectF,
-        width: Int,
-        height: Int,
-        label: String
-    ): String? {
-        val (direction, distance) = calculateDirection(box, width, height)
-        val context = contextMemory.getOrPut(label) { ObjectContext() }
-
-        return if (shouldReport(context, direction)) {
-            context.update(direction)
-            directionTemplates.random()(label, "$direction${getDistanceAdverb(distance)}")
-        } else {
-            null
-        }
+    private fun generateDirectionMessage(label: String, direction: String): String {
+        val templates = listOf("您的${direction}方向有$label", "检测到${direction}存在$label", "$label,位于${direction}方位")
+        return templates.random()
     }
 
-    private fun calculateDirection(box: RectF, width: Int, height: Int): Pair<String, String> {
-        val centerX = width / 2f
-        val centerY = height / 2f
-        val boxCenterX = (box.left + box.right) / 2
-        val boxCenterY = (box.top + box.bottom) / 2
+    fun getChineseLabel(original: String): String {
+        return mapOf(
+            "person" to "行人", "car" to "汽车", "bus" to "公交车",
+            "truck" to "卡车", "bicycle" to "自行车", "motorcycle" to "摩托车"
+        )[original.lowercase()] ?: original
+    }
+    // endregion
 
-        // 三维距离计算
-        val screenDiagonal = sqrt(width.toDouble().pow(2) + height.toDouble().pow(2))
-        val boxDiagonal = sqrt(box.width().toDouble().pow(2) + box.height().toDouble().pow(2))
-        val distance = when (boxDiagonal / screenDiagonal) {
-            in 0.3..1.0 -> "NEAR"
-            in 0.1..0.3 -> "MID"
-            else -> "FAR"
+    // region 辅助判断方法
+    private fun shouldSuppressMessage(label: String): Boolean {
+        return label == "unknown" || label.contains("background")
+    }
+
+    private fun isCriticalDetection(result: Detection): Boolean {
+        return DANGEROUS_LABELS.any { label ->
+            result.categories.any { it.label == label && it.score > 0.7 }
+        } && result.boundingBox.width() > 0.25f
+    }
+
+    private fun shouldReport(context: ObjectContext, newMessage: String): Boolean {
+        val baseInterval = when {
+            newMessage.contains("注意！") -> MIN_REPORT_INTERVAL_MS / 2
+            newMessage.contains("危险！") -> MIN_REPORT_INTERVAL_MS * 2 / 3
+            else -> MIN_REPORT_INTERVAL_MS
         }
+        return System.currentTimeMillis() - context.lastReportTime > (baseInterval / context.speedFactor).toLong()
+    }
 
-        // 九宫格方向判断
-        val direction = when {
-            boxCenterX < centerX * 0.4 && boxCenterY < centerY * 0.4 -> "左前方"
-            boxCenterX > centerX * 1.6 && boxCenterY < centerY * 0.4 -> "右前方"
-            boxCenterX < centerX * 0.4 && boxCenterY > centerY * 1.6 -> "左后方"
-            boxCenterX > centerX * 1.6 && boxCenterY > centerY * 1.6 -> "右后方"
-            boxCenterX < centerX -> "左侧"
-            boxCenterX > centerX -> "右侧"
+    private fun calculateDirection(box: RectF): String {
+        return when (box.centerX()) {
+            in 0f..0.3f -> "左侧"
+            in 0.7f..1f -> "右侧"
             else -> "正前方"
         }
-
-        return direction to distance
     }
+    // endregion
 
-    private fun shouldReport(context: ObjectContext, newDirection: String): Boolean {
-        val timeElapsed = System.currentTimeMillis() - context.lastReportTime
-        return when {
-            timeElapsed > MEMORY_TIMEOUT -> true
-            context.lastDirection != newDirection -> true
-            context.reportCount < 3 -> true
-            else -> false
+    // 修改2：强化入队过滤逻辑
+    private fun enqueueMessage(message: String, direction: String, priority: MsgPriority, label: String) {
+        // 组合更多维度作为唯一键
+        val messageKey = "${label}_${direction}_${message.hashCode()}"
+        // 延长抑制时间为基本间隔的3倍
+        val suppressDuration = when (priority) {
+            MsgPriority.CRITICAL -> 5000
+            MsgPriority.HIGH -> 3000
+            MsgPriority.NORMAL -> 2000
         }
-    }
 
-    private fun ObjectContext.update(newDirection: String) {
-        lastReportTime = System.currentTimeMillis()
-        reportCount = (reportCount % 2) + 1
-        lastDirection = newDirection
-    }
+        // 严格的三重过滤
+        if (recentMessages[messageKey]?.let {
+                System.currentTimeMillis() - it < suppressDuration
+            } == true) return
 
-    private fun getDistanceAdverb(distance: String) =
-        distanceAdverbs[distance]?.random() ?: ""
+        // 增加内存队列检查
+        if (speechQueue.any { it.label == label && it.direction == direction && it.text == message }) return
 
-    private fun determinePriority(label: String) = when {
-        label in DANGEROUS_LABELS -> MsgPriority.HIGH
-        else -> MsgPriority.NORMAL
-    }
-
-    private fun shouldSuppressMessage(label: String) =
-        label == "unknown" || label.contains("背景")
-
-    // 队列管理系统
-    private fun queueMessage(message: String, priority: MsgPriority) {
-        val now = System.currentTimeMillis()
-
-        if (cooldownMap[message]?.let { now - it < MIN_COOLDOWN } == true) return
-        if (activeMessages.contains(message)) return
-        if (priority == MsgPriority.CRITICAL && now - (cooldownMap.values.maxOrNull()
-                ?: 0) < PRIORITY_COOLDOWN
-        ) return
+        recentMessages[messageKey] = System.currentTimeMillis()
 
         val item = SpeechItem(
             text = message,
-            priority = priority,
+            direction = direction,
+            basePriority = priority,
+            label = label,  // 添加label参数
             vibrationPattern = when (priority) {
                 MsgPriority.CRITICAL -> longArrayOf(0, 500, 200, 300)
                 MsgPriority.HIGH -> longArrayOf(0, 300, 100, 200)
-                MsgPriority.NORMAL -> longArrayOf(0, 200) // 新增200ms短震动
+                MsgPriority.NORMAL -> longArrayOf(0, 200)
             }
         )
 
-        manageQueue(item)
-        cooldownMap[message] = now
-        activeMessages.add(message)
-    }
-
-    // 修改 manageQueue 方法
-    private fun manageQueue(item: SpeechItem) {
-        when (item.priority) {
-            MsgPriority.CRITICAL -> {
-                // 只移除低优先级消息，保留同优先级
-                speechQueue.values.removeAll { it.priority < MsgPriority.CRITICAL }
-                speechQueue[item.id] = item
-                interruptCurrentSpeech()
+        queueLock.withLock {
+            if (!speechQueue.any { it.label == label && it.direction == direction }) {
+                speechQueue.put(item)
+                triggerVibration(item)
             }
-            MsgPriority.HIGH -> {
-                // 允许NORMAL消息共存
-                speechQueue[item.id] = item
-                if (currentSpeechId == null) processNextInQueue()
-            }
-            MsgPriority.NORMAL -> {
-                // 增加去重逻辑
-                if (!speechQueue.values.any { it.text == item.text && it.priority == item.priority }) {
-                    speechQueue[item.id] = item
-                    if (currentSpeechId == null) processNextInQueue()
-                }
-            }
-        }
-    }
-
-    private fun processNextInQueue() {
-        if (currentSpeechId != null || speechQueue.isEmpty()) return
-
-        val item = speechQueue.values.maxWith(
-            compareBy(
-                { it.priority.ordinal },
-                { -speechQueue.keys.indexOf(it.id) }
-            )
-        )
-        item.let {
-            speechQueue.remove(it.id)
-            speak(it)
-        }
-    }
-
-    // 修改 speak 方法
-    private fun speak(item: SpeechItem) {
-        try {
-            // 先触发震动再开始语音
-            triggerVibration(item)
-
-            val params = Bundle().apply {
-                putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, item.id)
-                putInt(TextToSpeech.Engine.KEY_PARAM_PAN, calculatePan(item.text))
-            }
-
-            tts.speak(item.text, TextToSpeech.QUEUE_ADD, params, item.id)
-            showToast(item.text)
-        } catch (e: IllegalStateException) {
-            Log.e("TTS", "播报失败", e)
-            processNextInQueue()
-        }
-    }
-
-
-    private fun interruptCurrentSpeech() {
-        currentSpeechId?.let {
-            try {
-                tts.stop()
-            } catch (e: IllegalStateException) {
-                Log.e("TTS", "中断当前语音失败", e)
-            }
-            currentSpeechId = null
         }
         processNextInQueue()
     }
 
-    // 完善 triggerVibration 方法
-    private fun triggerVibration(item: SpeechItem) {
-        if (!isVibrationAvailable()) {
-            Log.w("Vibration", "Vibrator not available")
-            return
-        }
 
-        val now = System.currentTimeMillis()
-        if (now - lastVibrationTime < 150) { // 优化时间间隔为150ms
-            Log.d("Vibration", "Vibration throttled")
-            return
-        }
-
-        item.vibrationPattern?.let { pattern ->
-            try {
-                vibrator?.let { vib ->
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        // 动态振幅配置（必须设置）
-                        val amplitudes = IntArray(pattern.size) { index ->
-                            when {
-                                index % 2 == 0 -> 0 // 间隔时段
-                                item.priority == MsgPriority.CRITICAL -> 255
-                                item.priority == MsgPriority.HIGH -> 192
-                                else -> 150 // NORMAL优先级需要明确振幅
-                            }
-                        }
-                        vib.vibrate(VibrationEffect.createWaveform(pattern, amplitudes, -1))
-                    } else {
-                        @Suppress("DEPRECATION")
-                        vib.vibrate(pattern, -1)
-                    }
-                    lastVibrationTime = now
-                    Log.d("Vibration", "Vibration triggered: ${pattern.contentToString()}")
-                }
-            } catch (e: Exception) {
-                Log.e("Vibration", "Error in vibration: ${e.localizedMessage}")
+    private fun processNextInQueue() {
+        queueLock.withLock {
+            if (currentSpeechId != null || speechQueue.isEmpty()) return@withLock
+            speechQueue.poll()?.let { item ->
+                currentSpeechId = item.id
+                executor.submit { speak(item) } // 在锁内完成出队和状态更新
             }
         }
     }
 
-    private fun showToast(message: String) {
-        handler.post {
-            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+    private fun speak(item: SpeechItem) {
+        try {
+            if (Build.MANUFACTURER.equals("Xiaomi", ignoreCase = true)) {
+                // 小米设备需要延迟触发
+                Handler(Looper.getMainLooper()).postDelayed({
+                    doSpeak(item)
+                }, 200)
+            } else {
+                doSpeak(item)
+            }
+        } catch (e: Exception) {
+            Log.e("TTS", "播报失败: ${e.message}")
+            processNextInQueue()
+        }
+    }
+
+    private fun doSpeak(item: SpeechItem) {
+        try {
+            val params = Bundle().apply {
+                putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, item.id)
+                putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_SYSTEM)
+                putFloat("rate", 1.2f)
+            }
+
+            tts.speak(item.text, TextToSpeech.QUEUE_ADD, params, item.id)
+            showToast(item.text)
+        }catch (e: Exception) {
+            Log.e("TTS", "播报失败: ${e.message}")
+            currentSpeechId = null // 异常时清除状态
+            processNextInQueue()
+        }
+
+    }
+    // endregion
+
+    // region 振动反馈
+    private fun triggerVibration(item: SpeechItem) {
+        vibrator?.let {
+            try {
+                item.vibrationPattern?.let { pattern ->
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        it.vibrate(VibrationEffect.createWaveform(pattern, -1))
+                    } else {
+                        @Suppress("DEPRECATION") it.vibrate(pattern, -1)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("Vibration", "振动失败: ${e.message}")
+            }
+        }
+    }
+    // endregion
+
+    // region 工具方法
+    private fun showToast(message: String, isLong: Boolean = false) {
+        mainHandler.post {
+            Toast.makeText(context, message, if (isLong) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
         }
     }
 
     fun shutdown() {
-        try {
-            tts.stop()
-            tts.shutdown()
-        } catch (e: IllegalStateException) {
-            Log.e("TTS", "关闭语音引擎失败", e)
-        }
-        handler.removeCallbacksAndMessages(null)
+        batchProcessor.shutdown()
+        executor.shutdown()
+        vibrator?.cancel()
+        tts.stop()
+        tts.shutdown()
         speechQueue.clear()
-        activeMessages.clear()
         contextMemory.clear()
     }
-
-    // 中文标签系统（完整版）
-    private val labelTranslations = mapOf(
-        "person" to "行人",
-        "bicycle" to "自行车",
-        "car" to "汽车",
-        "motorcycle" to "摩托车",
-        "airplane" to "飞机",
-        "bus" to "公交车",
-        "train" to "火车",
-        "truck" to "卡车",
-        "boat" to "船只",
-        "traffic light" to "交通灯",
-        "fire hydrant" to "消防栓",
-        "stop sign" to "停车标志",
-        "parking meter" to "停车计时器",
-        "bench" to "长椅",
-        "bird" to "鸟类",
-        "cat" to "猫",
-        "dog" to "狗",
-        "horse" to "马",
-        "sheep" to "羊",
-        "cow" to "牛",
-        "elephant" to "大象",
-        "bear" to "熊",
-        "zebra" to "斑马",
-        "giraffe" to "长颈鹿",
-        "backpack" to "背包",
-        "umbrella" to "雨伞",
-        "handbag" to "手提包",
-        "tie" to "领带",
-        "suitcase" to "行李箱",
-        "frisbee" to "飞盘",
-        "skis" to "滑雪板",
-        "snowboard" to "滑雪单板",
-        "sports ball" to "运动球类",
-        "kite" to "风筝",
-        "baseball bat" to "棒球棒",
-        "baseball glove" to "棒球手套",
-        "skateboard" to "滑板",
-        "surfboard" to "冲浪板",
-        "tennis racket" to "网球拍",
-        "bottle" to "瓶子",
-        "wine glass" to "酒杯",
-        "cup" to "杯子",
-        "fork" to "叉子",
-        "knife" to "刀具",
-        "spoon" to "勺子",
-        "bowl" to "碗",
-        "banana" to "香蕉",
-        "apple" to "苹果",
-        "sandwich" to "三明治",
-        "orange" to "橙子",
-        "broccoli" to "西兰花",
-        "carrot" to "胡萝卜",
-        "hot dog" to "热狗",
-        "pizza" to "披萨",
-        "donut" to "甜甜圈",
-        "cake" to "蛋糕",
-        "chair" to "椅子",
-        "couch" to "沙发",
-        "potted plant" to "盆栽",
-        "bed" to "床",
-        "dining table" to "餐桌",
-        "toilet" to "马桶",
-        "tv" to "电视",
-        "laptop" to "笔记本",
-        "mouse" to "鼠标",
-        "remote" to "遥控器",
-        "keyboard" to "键盘",
-        "cell phone" to "手机",
-        "microwave" to "微波炉",
-        "oven" to "烤箱",
-        "toaster" to "烤面包机",
-        "sink" to "水槽",
-        "refrigerator" to "冰箱",
-        "book" to "书籍",
-        "clock" to "时钟",
-        "vase" to "花瓶",
-        "scissors" to "剪刀",
-        "teddy bear" to "玩偶",
-        "hair drier" to "吹风机",
-        "toothbrush" to "牙刷",
-        "door" to "门",
-        "window" to "窗户",
-        "stairs" to "楼梯",
-        "curtain" to "窗帘",
-        "mirror" to "镜子"
-    )
-
-    fun getChineseLabel(original: String): String {
-        val normalized = original
-            .lowercase(Locale.ROOT)
-            .replace(Regex("[^a-z ]"), "")
-            .trim()
-
-        return labelTranslations[normalized] ?: normalized.split(" ")
-            .joinToString("") { part ->
-                labelTranslations[part] ?: part
-            }.takeIf { it.isNotBlank() } ?: "物体"
-    }
-
-    private fun calculatePan(text: String): Int {
-        return when {
-            text.contains("左") -> -1 // 左声道
-            text.contains("右") -> 1  // 右声道
-            else -> 0               // 居中
-        }
-    }
+    // endregion
 }
