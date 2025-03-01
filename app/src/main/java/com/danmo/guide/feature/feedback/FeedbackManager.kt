@@ -14,13 +14,18 @@ import kotlin.math.pow
 import kotlin.math.sqrt
 
 class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
-    private val context: Context = context.applicationContext
+    private val context: Context = context.applicationContext // 使用应用上下文
     private var tts: TextToSpeech = TextToSpeech(context, this)
-    private val vibrator: Vibrator? =
-        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
+    private val vibrator: Vibrator? by lazy {
+        context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+    }
     private var isTtsReady = false
     private var lastVibrationTime = 0L
 
+    // 确保震动器可用性检查
+    private fun isVibrationAvailable(): Boolean {
+        return vibrator?.hasVibrator() ?: false
+    }
     // 消息优先级系统
     private enum class MsgPriority { CRITICAL, HIGH, NORMAL }
     private data class SpeechItem(
@@ -127,6 +132,7 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
             currentSpeechId = utteranceId
             handler.post {
                 speechQueue.remove(utteranceId)?.let { item ->
+                    // 立即触发震动
                     triggerVibration(item)
                     activeMessages.remove(item.text)
                 }
@@ -137,6 +143,8 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
             handler.post {
                 currentSpeechId = null
                 processNextInQueue()
+                //添加延迟保证震动完成
+                handler.postDelayed({ processNextInQueue() }, 300)
             }
         }
 
@@ -278,8 +286,8 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
             priority = priority,
             vibrationPattern = when (priority) {
                 MsgPriority.CRITICAL -> longArrayOf(0, 500, 200, 300)
-                MsgPriority.HIGH -> longArrayOf(0, 200)
-                else -> null
+                MsgPriority.HIGH -> longArrayOf(0, 300, 100, 200)
+                MsgPriority.NORMAL -> longArrayOf(0, 200) // 新增200ms短震动
             }
         )
 
@@ -288,22 +296,23 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
         activeMessages.add(message)
     }
 
+    // 修改 manageQueue 方法
     private fun manageQueue(item: SpeechItem) {
         when (item.priority) {
             MsgPriority.CRITICAL -> {
-                speechQueue.clear()
+                // 只移除低优先级消息，保留同优先级
+                speechQueue.values.removeAll { it.priority < MsgPriority.CRITICAL }
                 speechQueue[item.id] = item
                 interruptCurrentSpeech()
             }
-
             MsgPriority.HIGH -> {
-                speechQueue.values.removeAll { it.priority == MsgPriority.NORMAL }
+                // 允许NORMAL消息共存
                 speechQueue[item.id] = item
                 if (currentSpeechId == null) processNextInQueue()
             }
-
             MsgPriority.NORMAL -> {
-                if (!speechQueue.values.any { it.text == item.text }) {
+                // 增加去重逻辑
+                if (!speechQueue.values.any { it.text == item.text && it.priority == item.priority }) {
                     speechQueue[item.id] = item
                     if (currentSpeechId == null) processNextInQueue()
                 }
@@ -326,18 +335,18 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
         }
     }
 
+    // 修改 speak 方法
     private fun speak(item: SpeechItem) {
         try {
-            // 新版本保留基础参数
+            // 先触发震动再开始语音
+            triggerVibration(item)
+
             val params = Bundle().apply {
                 putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, item.id)
                 putInt(TextToSpeech.Engine.KEY_PARAM_PAN, calculatePan(item.text))
             }
+
             tts.speak(item.text, TextToSpeech.QUEUE_ADD, params, item.id)
-
-            // 全局语速设置（影响后续所有语音）
-            tts.setSpeechRate(1.1f.takeIf { item.priority == MsgPriority.CRITICAL } ?: 0.9f)
-
             showToast(item.text)
         } catch (e: IllegalStateException) {
             Log.e("TTS", "播报失败", e)
@@ -358,22 +367,42 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
         processNextInQueue()
     }
 
+    // 完善 triggerVibration 方法
     private fun triggerVibration(item: SpeechItem) {
-        if (System.currentTimeMillis() - lastVibrationTime < 1000) return
+        if (!isVibrationAvailable()) {
+            Log.w("Vibration", "Vibrator not available")
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        if (now - lastVibrationTime < 150) { // 优化时间间隔为150ms
+            Log.d("Vibration", "Vibration throttled")
+            return
+        }
 
         item.vibrationPattern?.let { pattern ->
-            vibrator?.let {
-                try {
+            try {
+                vibrator?.let { vib ->
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        it.vibrate(VibrationEffect.createWaveform(pattern, -1))
+                        // 动态振幅配置（必须设置）
+                        val amplitudes = IntArray(pattern.size) { index ->
+                            when {
+                                index % 2 == 0 -> 0 // 间隔时段
+                                item.priority == MsgPriority.CRITICAL -> 255
+                                item.priority == MsgPriority.HIGH -> 192
+                                else -> 150 // NORMAL优先级需要明确振幅
+                            }
+                        }
+                        vib.vibrate(VibrationEffect.createWaveform(pattern, amplitudes, -1))
                     } else {
                         @Suppress("DEPRECATION")
-                        it.vibrate(pattern, -1)
+                        vib.vibrate(pattern, -1)
                     }
-                    lastVibrationTime = System.currentTimeMillis()
-                } catch (e: Exception) {
-                    Log.e("Vibration", "振动反馈失败", e)
+                    lastVibrationTime = now
+                    Log.d("Vibration", "Vibration triggered: ${pattern.contentToString()}")
                 }
+            } catch (e: Exception) {
+                Log.e("Vibration", "Error in vibration: ${e.localizedMessage}")
             }
         }
     }
