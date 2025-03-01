@@ -41,15 +41,22 @@ class MainActivity : ComponentActivity() {
     // 光线传感器阈值（单位：lux）
     private companion object {
         const val LIGHT_THRESHOLD = 10.0f // 低于此值开启闪光灯
-        const val UPDATE_INTERVAL = 1000L // 传感器更新间隔
     }
 
 
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) startCamera()
-        else showToast("Camera permission required for guide feature")
+        if (granted) {
+            startCamera()
+        } else {
+            // 根据用户是否选择"不再询问"显示不同提示
+            if (shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)) {
+                showToast("需要相机权限来提供导览功能，请授予权限")
+            } else {
+                showToast("相机权限被永久拒绝，请到应用设置中启用")
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

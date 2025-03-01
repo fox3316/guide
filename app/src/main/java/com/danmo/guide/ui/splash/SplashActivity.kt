@@ -6,12 +6,16 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityOptionsCompat
 import com.danmo.guide.R
 import com.danmo.guide.ui.main.MainActivity
 
 @SuppressLint("CustomSplashScreen")
 class SplashActivity : AppCompatActivity() {
-    private val SPLASH_DELAY = 2000L // 2秒延迟
+    // 使用驼峰命名法，移动到伴生对象
+    companion object {
+        private const val SPLASH_DELAY = 2000L // 2秒延迟
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -23,10 +27,15 @@ class SplashActivity : AppCompatActivity() {
     }
 
     private fun navigateToMain() {
-        val intent = Intent(this, MainActivity::class.java).apply {
+        val options = ActivityOptionsCompat.makeCustomAnimation(
+            this,
+            android.R.anim.fade_in,  // 进入动画
+            android.R.anim.fade_out  // 退出动画
+        )
+
+        Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            startActivity(this, options.toBundle())
         }
-        startActivity(intent)
-        overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out)
     }
 }

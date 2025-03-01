@@ -68,5 +68,4 @@ class CameraManager(
         }
     }
 
-    fun isTorchEnabled(): Boolean = isTorchActive
 }
