@@ -94,6 +94,10 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
         var speechEnabled: Boolean = true
         var speechRate: Float = 1.2f
         var confidenceThreshold: Float = CONFIDENCE_THRESHOLD
+        private const val LEFT_BOUNDARY = 0.3f
+        private const val RIGHT_BOUNDARY = 0.7f
+        private const val CENTER_LEFT = 0.4f
+        private const val CENTER_RIGHT = 0.6f
 
         @Volatile
         private var instance: FeedbackManager? = null
@@ -401,10 +405,17 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
         return System.currentTimeMillis() - context.lastReportTime > (baseInterval / context.speedFactor).toLong()
     }
 
+    // 更精确的方向判断
     private fun calculateDirection(box: RectF): String {
-        return when (box.centerX()) {
-            in 0f..0.3f -> "左侧"
-            in 0.7f..1f -> "右侧"
+        val widthFactor = box.width() / 2
+
+        return when {
+            box.left <= LEFT_BOUNDARY || box.centerX() - widthFactor <= LEFT_BOUNDARY ->
+                "左侧"
+            box.right >= RIGHT_BOUNDARY || box.centerX() + widthFactor >= RIGHT_BOUNDARY ->
+                "右侧"
+            box.centerX() < CENTER_LEFT -> "左前方"
+            box.centerX() > CENTER_RIGHT -> "右前方"
             else -> "正前方"
         }
     }
