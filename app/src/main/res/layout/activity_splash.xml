@@ -37,7 +37,7 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toBottomOf="@id/iv_logo"
         app:layout_constraintVertical_chainStyle="packed"
-        tools:text="科技不是高高在上，而是服务每一个人"/>
+        tools:text="代码有温度，给算法赋予心跳。此刻开始，光迹就是你感知世界的第二双眼睛!"/>
 
     <!-- 加载状态容器 -->
     <LinearLayout

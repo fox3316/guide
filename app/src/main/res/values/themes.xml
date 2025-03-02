@@ -1,8 +1,16 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
+<!-- res/values/themes.xml -->
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- 应用主主题 -->
+    <style name="AppTheme" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/purple_500</item>
+        <item name="colorPrimaryVariant">@color/purple_700</item>
+        <item name="colorOnPrimary">@color/white</item>
+    </style>
 
-    <style name="Theme.Guide" parent="android:Theme.Material.Light.NoActionBar" />
-    <!-- 闪屏页专用主题 -->
+    <!-- 主界面主题（继承自AppTheme） -->
+    <style name="Theme.Guide" parent="AppTheme"/>
+
+    <!-- 闪屏页主题 -->
     <style name="SplashTheme" parent="Theme.AppCompat.Light.NoActionBar">
         <item name="android:windowBackground">@android:color/white</item>
         <item name="android:windowFullscreen">true</item>

@@ -2,6 +2,7 @@ package com.danmo.guide.ui.main
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -9,17 +10,21 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Bundle
 import android.util.Log
+import android.view.Menu
+import android.view.MenuItem
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.ImageAnalysis
 import androidx.core.content.ContextCompat
+import com.danmo.guide.R
 import com.danmo.guide.databinding.ActivityMainBinding
 import com.danmo.guide.feature.camera.CameraManager
 import com.danmo.guide.feature.camera.ImageProxyUtils
 import com.danmo.guide.feature.detection.ObjectDetectorHelper
 import com.danmo.guide.feature.feedback.FeedbackManager
 import com.danmo.guide.ui.components.OverlayView
+import com.danmo.guide.ui.settings.SettingsActivity
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.task.vision.detector.Detection
 import java.util.concurrent.ExecutorService
@@ -73,7 +78,12 @@ class MainActivity : ComponentActivity() {
         lightSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)
 
         checkCameraPermission()
+        // 新增点击监听
+        binding.fabSettings.setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
     }
+
 
     // 传感器事件监听器
     private val lightSensorListener = object : SensorEventListener {

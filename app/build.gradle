@@ -110,6 +110,7 @@ dependencies {
         exclude group: 'com.google.ai.edge.litert', module: 'litert'
         exclude group: 'com.google.ai.edge.litert', module: 'litert-api'
     }
+    implementation(libs.material)
 
     // 其他
     implementation(libs.oboe)
@@ -118,6 +119,7 @@ dependencies {
     implementation libs.firebase.crashlytics.buildtools
     implementation libs.tensorflow.lite.metadata
     implementation libs.firebase.firestore.ktx
+    implementation libs.androidx.preference.ktx
     testImplementation libs.junit
     androidTestImplementation libs.androidx.junit
     androidTestImplementation libs.androidx.espresso.core
