@@ -1,4 +1,3 @@
-```markdown
 # Guide - Intelligent Navigation Assistant
 
 
