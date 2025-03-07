@@ -17,6 +17,14 @@ import kotlin.concurrent.withLock
 import kotlin.math.max
 import kotlin.math.min
 
+
+private const val FAR_LEFT_BOUNDARY = 0.15f    // 最左侧区域
+private const val NEAR_LEFT_BOUNDARY = 0.3f    // 左侧近区域
+private const val CENTER_LEFT = 0.4f           // 中心偏左边界
+private const val CENTER_RIGHT = 0.6f           // 中心偏右边界
+private const val NEAR_RIGHT_BOUNDARY = 0.7f   // 右侧近区域
+private const val FAR_RIGHT_BOUNDARY = 0.85f    // 最右侧区域
+
 class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
 
     // 初始化上下文和硬件组件
@@ -66,6 +74,7 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
     }
 
     // 并发管理组件
+
     private val speechQueue = PriorityBlockingQueue<SpeechItem>()
     private val executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -74,6 +83,8 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
     // 批处理系统
     private val pendingDetections = ConcurrentLinkedQueue<Detection>()
     private val batchProcessor = Executors.newSingleThreadScheduledExecutor()
+
+
 
     // 上下文记忆系统
     private data class ObjectContext(
@@ -290,8 +301,26 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
     }
 
     private fun generateDirectionMessage(label: String, direction: String): String {
-        val templates = listOf("您的${direction}方向有$label", "检测到${direction}存在$label", "$label,位于${direction}方位")
-        return templates.random()
+        val templates = mapOf(
+            "最左侧" to listOf("注意！最左侧发现$label", "$label,位于最左边区域"),
+            "左侧" to listOf("您的左侧有$label", "检测到左侧存在$label"),
+            "左侧偏右" to listOf("左侧偏右位置检测到$label", "$label,在左侧靠右区域"),
+            "左前方偏左" to listOf("左前方偏左位置有$label", "检测到左前方左侧存在$label"),
+            "左前方" to listOf("左前方发现$label", "$label,位于左前方"),
+            "左前方偏右" to listOf("左前方偏右位置检测到$label", "$label,在左前方靠右区域"),
+            "正前方(大范围)" to listOf("正前方检测到大型$label", "大面积$label,位于正前方"),
+            "正前方偏左" to listOf("正前方偏左位置有$label", "$label,在正前方靠左区域"),
+            "正前方" to listOf("正前方发现$label", "检测到正前方存在$label"),
+            "正前方偏右" to listOf("正前方偏右位置检测到$label", "$label,在正前方靠右区域"),
+            "右前方偏左" to listOf("右前方偏左位置有$label", "检测到右前方左侧存在$label"),
+            "右前方" to listOf("右前方发现$label", "$label,位于右前方"),
+            "右前方偏右" to listOf("右前方偏右位置检测到$label", "$label,在右前方靠右区域"),
+            "右侧偏左" to listOf("右侧偏左位置有$label", "检测到右侧靠左区域存在$label"),
+            "右侧" to listOf("您的右侧有$label", "检测到右侧存在$label"),
+            "最右侧" to listOf("注意！最右侧发现$label", "$label,位于最右边区域")
+        )
+
+        return templates[direction]?.random() ?: "检测到$label"
     }
 
     fun getChineseLabel(original: String): String {
@@ -406,19 +435,52 @@ class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
     }
 
     // 更精确的方向判断
-    private fun calculateDirection(box: RectF): String {
-        val widthFactor = box.width() / 2
 
+    private fun calculateDirection(box: RectF): String {
+        val centerX = box.centerX()
+        val widthFactor = box.width() * 0.35f  // 考虑物体宽度的影响因子
+
+        // 区域划分（从左到右）：
+        // [0.0]----[FAR_LEFT]----[NEAR_LEFT]----[C_LEFT]----[C_RIGHT]----[NEAR_RIGHT]----[FAR_RIGHT]----[1.0]
         return when {
-            box.left <= LEFT_BOUNDARY || box.centerX() - widthFactor <= LEFT_BOUNDARY ->
-                "左侧"
-            box.right >= RIGHT_BOUNDARY || box.centerX() + widthFactor >= RIGHT_BOUNDARY ->
-                "右侧"
-            box.centerX() < CENTER_LEFT -> "左前方"
-            box.centerX() > CENTER_RIGHT -> "右前方"
-            else -> "正前方"
+            // 左侧区域判断
+            centerX - widthFactor < FAR_LEFT_BOUNDARY -> "最左侧"
+            centerX < NEAR_LEFT_BOUNDARY -> when {
+                box.right > NEAR_LEFT_BOUNDARY -> "左侧偏右"
+                else -> "左侧"
+            }
+
+            // 左前方区域判断
+            centerX < CENTER_LEFT -> when {
+                box.right > CENTER_LEFT + 0.05f -> "左前方偏右"
+                box.left < NEAR_LEFT_BOUNDARY - 0.05f -> "左前方偏左"
+                else -> "左前方"
+            }
+
+            // 正前方区域判断
+            centerX < CENTER_RIGHT -> when {
+                box.width() > 0.3f -> "正前方(大范围)"
+                box.left < CENTER_LEFT - 0.05f -> "正前方偏左"
+                box.right > CENTER_RIGHT + 0.05f -> "正前方偏右"
+                else -> "正前方"
+            }
+
+            // 右前方区域判断
+            centerX < NEAR_RIGHT_BOUNDARY -> when {
+                box.left < CENTER_RIGHT - 0.05f -> "右前方偏左"
+                box.right > NEAR_RIGHT_BOUNDARY + 0.05f -> "右前方偏右"
+                else -> "右前方"
+            }
+
+            // 右侧区域判断
+            centerX + widthFactor > FAR_RIGHT_BOUNDARY -> "最右侧"
+            else -> when {
+                box.left < NEAR_RIGHT_BOUNDARY -> "右侧偏左"
+                else -> "右侧"
+            }
         }
     }
+
     // endregion
 
     // 修改2：强化入队过滤逻辑
