@@ -149,6 +149,8 @@ class MainActivity : ComponentActivity() {
                     val rotationDegrees = imageProxy.imageInfo.rotationDegrees
                     val results = objectDetectorHelper.detect(tensorImage, rotationDegrees)
 
+                    overlayView.setModelInputSize(tensorImage.width, tensorImage.height)
+                    Log.d("OverlayView", "View Size: tensorImage.width=${tensorImage.width}, tensorImage.height=${tensorImage.height}")
                     updateOverlayView(results, rotationDegrees)
                     updateStatusUI(results)
                     handleDetectionResults(results)
