@@ -4,7 +4,7 @@
 An AI-powered assistive application leveraging computer vision to provide real-time obstacle detection and multimodal feedback for visually impaired users and those needing enhanced environmental awareness.
 
 ## Key Features
-
+ 
 - **Real-Time Perception**
   - 80+ object detection with TensorFlow Lite (EfficientDet-Lite0 model)
   - Adaptive ambient light adjustment (Auto-flash)
